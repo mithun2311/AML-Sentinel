@@ -1,0 +1,481 @@
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import plotly.express as px
+import streamlit as st
+
+
+ROOT = Path(__file__).resolve().parents[1]
+OUTPUTS = ROOT / "outputs"
+
+st.set_page_config(
+    page_title="AML Sentinel | Analytics",
+    page_icon="🛡️",
+    layout="wide",
+)
+
+st.title("🛡️ AML Sentinel")
+st.caption(
+    "Big Data Analytics for Anti-Money Laundering "
+    "and Suspicious Transaction Network Detection"
+)
+
+st.sidebar.header("Control Panel")
+st.sidebar.caption("Historical batch analytics + Kafka demo stream")
+
+if st.sidebar.button("Refresh dashboard", use_container_width=True):
+    st.rerun()
+
+st.sidebar.markdown("---")
+st.sidebar.write("**Data sources**")
+st.sidebar.caption("HDFS/Spark evaluation outputs")
+st.sidebar.caption("NetworkX graph analytics")
+st.sidebar.caption("Kafka consumer JSONL logs")
+
+
+def read_json(path):
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as file:
+                return json.load(file)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}
+
+
+def read_csv(path):
+    try:
+        if path.exists():
+            return pd.read_csv(path)
+    except (OSError, ValueError, pd.errors.ParserError):
+        pass
+    return pd.DataFrame()
+
+
+def read_jsonl(path, max_lines=5000):
+    """Read only the most recent lines to keep the dashboard responsive."""
+    if not path.exists():
+        return pd.DataFrame()
+
+    rows = []
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            lines = file.readlines()[-max_lines:]
+
+        for line in lines:
+            try:
+                value = json.loads(line)
+                if isinstance(value, dict):
+                    rows.append(value)
+            except json.JSONDecodeError:
+                continue
+    except OSError:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
+
+
+metrics = read_json(OUTPUTS / "evaluation_metrics.json")
+stream_summary = read_json(OUTPUTS / "streaming_summary.json")
+
+stream_events = read_jsonl(OUTPUTS / "streaming_events.jsonl")
+stream_alerts = read_jsonl(OUTPUTS / "streaming_alerts.jsonl")
+
+network_summary = read_json(OUTPUTS / "network_summary.json")
+pattern_summary = read_json(OUTPUTS / "network_pattern_summary.json")
+
+accounts = read_csv(OUTPUTS / "network_top_accounts.csv")
+if accounts.empty:
+    accounts = read_csv(OUTPUTS / "network_pattern_accounts.csv")
+
+edges = read_csv(OUTPUTS / "network_pattern_edges.csv")
+rule_quality = read_csv(OUTPUTS / "rule_quality.csv")
+risk_distribution = read_csv(OUTPUTS / "risk_score_distribution.csv")
+thresholds = read_csv(OUTPUTS / "threshold_comparison.csv")
+
+tab_overview, tab_stream, tab_network, tab_evaluation = st.tabs([
+    "Overview",
+    "Kafka Stream",
+    "Network Analytics",
+    "Detection Evaluation",
+])
+
+# -------------------------------------------------------------------
+# OVERVIEW
+# -------------------------------------------------------------------
+with tab_overview:
+    st.subheader("System Overview")
+
+    batch_total = metrics.get("total_transactions", 0)
+    batch_alerts = metrics.get("predicted_alerts", 0)
+    batch_precision = metrics.get("precision")
+    batch_recall = metrics.get("recall")
+    batch_f1 = metrics.get("f1_score")
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric(
+        "Historical transactions",
+        f"{int(batch_total):,}" if batch_total else "Not loaded",
+    )
+    c2.metric(
+        "Historical alerts",
+        f"{int(batch_alerts):,}" if batch_alerts else "Not loaded",
+    )
+    c3.metric(
+        "Stream events processed",
+        f"{len(stream_events):,}",
+    )
+    c4.metric(
+        "Stream alerts saved",
+        f"{len(stream_alerts):,}",
+    )
+
+    st.info(
+        "Historical Spark analytics and the Kafka streaming demonstration "
+        "use separate scoring logic. Their metrics and alert counts "
+        "must not be treated as interchangeable."
+    )
+
+    st.markdown("### Pipeline status")
+
+    components = [
+        ("HDFS raw and processed data",
+         "Implemented; verify Hadoop services are running."),
+        ("Spark historical preprocessing",
+         "Implemented; cleaned Parquet is stored in HDFS."),
+        ("Historical rule-based detection",
+         "Implemented; evaluation shows significant false positives."),
+        ("Kafka producer and consumer",
+         "Demonstrated; synthetic events have been processed."),
+        ("Network analytics",
+         "Available; results are based on selected suspicious edges."),
+    ]
+
+    for name, detail in components:
+        with st.container(border=True):
+            st.markdown(f"**{name}**")
+            st.caption(detail)
+
+    st.markdown("### Historical detector metrics")
+
+    if metrics:
+        metric_columns = st.columns(4)
+
+        for column, key, label in zip(
+            metric_columns,
+            ["precision", "recall", "f1_score", "accuracy"],
+            ["Precision", "Recall", "F1 score", "Accuracy"],
+        ):
+            value = metrics.get(key)
+            column.metric(
+                label,
+                f"{float(value) * 100:.3f}%"
+                if isinstance(value, (int, float))
+                else "N/A",
+            )
+
+        note = metrics.get("evaluation_note")
+        if note:
+            st.warning(str(note))
+    else:
+        st.warning(
+            "Historical evaluation metrics not found. "
+            "Run the batch detector to generate them."
+        )
+
+# -------------------------------------------------------------------
+# KAFKA STREAM
+# -------------------------------------------------------------------
+with tab_stream:
+    st.subheader("Kafka Streaming Monitor")
+
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Events in saved log", f"{len(stream_events):,}")
+    s2.metric("Alerts in saved log", f"{len(stream_alerts):,}")
+
+    if not stream_events.empty and "stream_risk_level" in stream_events:
+        high_count = int(
+            (stream_events["stream_risk_level"] == "HIGH").sum()
+        )
+        medium_count = int(
+            (stream_events["stream_risk_level"] == "MEDIUM").sum()
+        )
+    else:
+        high_count = 0
+        medium_count = 0
+
+    s3.metric("High-risk events", f"{high_count:,}")
+    s4.metric("Medium-risk events", f"{medium_count:,}")
+
+    st.caption(
+        "Counts above reflect the currently saved log, not necessarily "
+        "a single consumer run. Refresh to load newly written records."
+    )
+
+    if not stream_events.empty:
+        if "stream_risk_level" in stream_events:
+            risk_counts = (
+                stream_events["stream_risk_level"]
+                .value_counts()
+                .rename_axis("Risk level")
+                .reset_index(name="Transactions")
+            )
+
+            fig = px.bar(
+                risk_counts,
+                x="Risk level",
+                y="Transactions",
+                color="Risk level",
+                title="Streaming risk-level distribution",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Recent streaming events")
+
+        preferred = [
+            "event_time",
+            "transaction_id",
+            "Sender_account",
+            "Receiver_account",
+            "Amount",
+            "stream_risk_score",
+            "stream_risk_level",
+            "stream_alert",
+            "stream_alert_reasons",
+        ]
+        available = [c for c in preferred if c in stream_events.columns]
+
+        st.dataframe(
+            stream_events[available].tail(100),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info(
+            "No streaming events found yet. Run the Kafka producer "
+            "and consumer, then refresh the dashboard."
+        )
+
+    st.markdown("### Saved streaming alerts")
+
+    if not stream_alerts.empty:
+        preferred = [
+            "stream_processed_at",
+            "transaction_id",
+            "Sender_account",
+            "Receiver_account",
+            "Amount",
+            "stream_risk_score",
+            "stream_risk_level",
+            "stream_alert_reasons",
+        ]
+        available = [c for c in preferred if c in stream_alerts.columns]
+
+        st.dataframe(
+            stream_alerts[available].tail(200),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Download streaming alerts CSV",
+            stream_alerts.to_csv(index=False).encode("utf-8"),
+            file_name="aml_sentinel_streaming_alerts.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No streaming alerts have been saved.")
+
+    if stream_summary:
+        with st.expander("Latest consumer-run summary"):
+            st.json(stream_summary)
+
+# -------------------------------------------------------------------
+# NETWORK ANALYTICS
+# -------------------------------------------------------------------
+with tab_network:
+    st.subheader("Suspicious Transaction Network")
+
+    graph_nodes = pattern_summary.get(
+        "graph_nodes", network_summary.get("nodes")
+    )
+    graph_edges = pattern_summary.get(
+        "graph_edges", network_summary.get("edges")
+    )
+
+    n1, n2, n3 = st.columns(3)
+    n1.metric(
+        "Graph nodes",
+        f"{int(graph_nodes):,}" if graph_nodes is not None else "N/A",
+    )
+    n2.metric(
+        "Directed edges",
+        f"{int(graph_edges):,}" if graph_edges is not None else "N/A",
+    )
+    n3.metric(
+        "Nontrivial strongly connected components",
+        str(pattern_summary.get(
+            "strongly_connected_components_size_gt_1", "N/A"
+        )),
+    )
+
+    if pattern_summary:
+        st.warning(
+            pattern_summary.get(
+                "interpretation_note",
+                "Graph results cover selected suspicious account pairs, "
+                "not the complete transaction network.",
+            )
+        )
+    elif network_summary:
+        st.warning(network_summary.get("note", "Graph coverage is limited."))
+
+    if not accounts.empty:
+        st.markdown("### Accounts with high network metrics")
+
+        sort_column = (
+            "total_degree" if "total_degree" in accounts.columns
+            else "pagerank" if "pagerank" in accounts.columns
+            else accounts.columns[0]
+        )
+
+        top_accounts = accounts.sort_values(
+            sort_column, ascending=False
+        ).head(25)
+
+        chart_column = (
+            "total_degree" if "total_degree" in top_accounts.columns
+            else "in_degree" if "in_degree" in top_accounts.columns
+            else None
+        )
+
+        if chart_column and "account" in top_accounts.columns:
+            fig = px.bar(
+                top_accounts,
+                x="account",
+                y=chart_column,
+                title=f"Top accounts by {chart_column}",
+            )
+            fig.update_layout(xaxis_tickangle=-45)
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(
+            top_accounts,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Download account analytics CSV",
+            accounts.to_csv(index=False).encode("utf-8"),
+            file_name="aml_sentinel_network_accounts.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info(
+            "Network account results not found. Run the existing graph "
+            "analytics scripts first."
+        )
+
+    if not edges.empty:
+        st.markdown("### Selected suspicious account relationships")
+        st.dataframe(
+            edges.head(200),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if network_summary:
+        with st.expander("Original network summary"):
+            st.json(network_summary)
+
+# -------------------------------------------------------------------
+# DETECTION EVALUATION
+# -------------------------------------------------------------------
+with tab_evaluation:
+    st.subheader("Detection Quality and Evaluation")
+
+    if metrics:
+        evaluation_table = pd.DataFrame([
+            {"Metric": "Transactions", "Value": metrics.get("total_transactions")},
+            {"Metric": "True positives", "Value": metrics.get("true_positives")},
+            {"Metric": "False positives", "Value": metrics.get("false_positives")},
+            {"Metric": "False negatives", "Value": metrics.get("false_negatives")},
+            {"Metric": "True negatives", "Value": metrics.get("true_negatives")},
+            {"Metric": "Alert rate", "Value": metrics.get("alert_rate")},
+            {"Metric": "Prediction rule", "Value": metrics.get("prediction_rule")},
+            {"Metric": "Evaluation note", "Value": metrics.get("evaluation_note")},
+        ])
+
+        st.dataframe(
+            evaluation_table,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if not risk_distribution.empty:
+        st.markdown("### Risk-score distribution")
+
+        score_column = next(
+            (
+                c for c in risk_distribution.columns
+                if c.lower() in {"risk_score", "score"}
+            ),
+            None,
+        )
+        count_column = next(
+            (
+                c for c in risk_distribution.columns
+                if c.lower() in {
+                    "transactions", "transaction_count", "count"
+                }
+            ),
+            None,
+        )
+
+        if score_column and count_column:
+            fig = px.bar(
+                risk_distribution,
+                x=score_column,
+                y=count_column,
+                title="Transactions by risk score",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        st.dataframe(
+            risk_distribution,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if not rule_quality.empty:
+        st.markdown("### Individual rule quality")
+        st.dataframe(
+            rule_quality,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if not thresholds.empty:
+        st.markdown("### Threshold experiments")
+        st.dataframe(
+            thresholds,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if not metrics and rule_quality.empty and risk_distribution.empty:
+        st.info(
+            "Evaluation output files were not found. Run the existing "
+            "evaluation scripts to populate this page."
+        )
+
+st.divider()
+st.caption(
+    "AML Sentinel academic demonstration. Risk scores are decision "
+    "support signals, not proof of money laundering or production "
+    "financial advice. Streaming and historical scoring are separate."
+)

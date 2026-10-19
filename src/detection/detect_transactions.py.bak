@@ -1,0 +1,626 @@
+
+import json
+from pathlib import Path
+
+from pyspark.sql import SparkSession, functions as F
+from pyspark.sql.types import DoubleType
+
+
+# ============================================================
+# AML SENTINEL: BIG DATA AML DETECTION
+# Technologies: HDFS, PySpark, explainable rules, graph features
+# ============================================================
+
+HDFS_BASE = "hdfs://localhost:9000/aml-sentinel"
+INPUT_PATH = f"{HDFS_BASE}/processed/transactions_parquet"
+OUTPUT_PATH = f"{HDFS_BASE}/results/scored_transactions"
+
+# Existing thresholds from the previous full-data run.
+# Fan-in, fan-out and burst thresholds are configurable starting
+# heuristics and must be evaluated against the resulting metrics.
+SENDER_ACTIVITY_THRESHOLD = 754.0
+RECEIVER_ACTIVITY_THRESHOLD = 751.0
+FANOUT_THRESHOLD = 10.0
+FANIN_THRESHOLD = 10.0
+BURST_THRESHOLD = 20.0
+
+# Keep the initial scoring threshold explicit and easy to tune.
+RISK_ALERT_THRESHOLD = 4
+
+# ============================================================
+# 1. SPARK SESSION
+# ============================================================
+
+spark = (
+    SparkSession.builder
+    .appName("AML-Sentinel-RuleBased-Detection")
+    .master("local[2]")
+    .config("spark.hadoop.dfs.client.use.datanode.hostname", "true")
+    .config("spark.sql.shuffle.partitions", "96")
+    .config("spark.sql.adaptive.enabled", "true")
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+    .getOrCreate()
+)
+
+spark.sparkContext.setLogLevel("WARN")
+
+
+try:
+    # ========================================================
+    # 2. READ AND VALIDATE CLEANED DATA
+    # ========================================================
+
+    print("=" * 65)
+    print("AML SENTINEL - BIG DATA TRANSACTION DETECTION")
+    print("=" * 65)
+    print("Reading cleaned transactions from HDFS...")
+
+    df = spark.read.parquet(INPUT_PATH)
+
+    required = [
+        "Sender_account",
+        "Receiver_account",
+        "Amount",
+        "Date",
+        "Payment_currency",
+        "Received_currency",
+        "Sender_bank_location",
+        "Receiver_bank_location",
+        "Payment_type",
+        "Is_laundering",
+    ]
+
+    missing = [column for column in required if column not in df.columns]
+
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
+    df = (
+        df
+        .withColumn("Amount", F.col("Amount").cast(DoubleType()))
+        .withColumn("Is_laundering", F.col("Is_laundering").cast("int"))
+    )
+
+    # Fail early if critical transaction fields are invalid.
+    # The preprocessing stage should already have handled these.
+    print("Input schema validated.")
+
+    # ========================================================
+    # 3. DATA-DRIVEN TRANSACTION AMOUNT THRESHOLD
+    # ========================================================
+
+    # This quantile is calculated on transaction amounts, not on
+    # a high-cardinality grouped account table.
+    print("Calculating high-amount transaction threshold...")
+
+    amount_quantiles = df.approxQuantile(
+        "Amount",
+        [0.995],
+        0.01
+    )
+
+    if not amount_quantiles:
+        raise ValueError("Unable to calculate amount threshold.")
+
+    amount_threshold = float(amount_quantiles[0])
+
+    print(f"99.5th percentile amount: {amount_threshold:,.2f}")
+
+    # ========================================================
+    # 4. SENDER BEHAVIOURAL ANALYTICS
+    # ========================================================
+
+    print("Calculating sender behaviour...")
+
+    sender_stats = df.groupBy("Sender_account").agg(
+        F.count("*").alias("sender_tx_count"),
+
+        F.approx_count_distinct(
+            "Receiver_account",
+            0.02
+        ).alias("sender_unique_receivers"),
+
+        F.avg("Amount").alias("sender_avg_amount"),
+
+        F.stddev_pop("Amount").alias("sender_std_amount"),
+    )
+
+    # ========================================================
+    # 5. RECEIVER BEHAVIOURAL ANALYTICS
+    # ========================================================
+
+    print("Calculating receiver behaviour...")
+
+    receiver_stats = df.groupBy("Receiver_account").agg(
+        F.count("*").alias("receiver_tx_count"),
+
+        F.approx_count_distinct(
+            "Sender_account",
+            0.02
+        ).alias("receiver_unique_senders"),
+    )
+
+    # ========================================================
+    # 6. TRANSACTION BURST ANALYTICS
+    # ========================================================
+
+    print("Calculating sender daily transaction bursts...")
+
+    daily_activity = df.groupBy(
+        "Sender_account",
+        "Date"
+    ).agg(
+        F.count("*").alias("sender_day_count")
+    )
+
+    # Do not calculate further percentiles on these large,
+    # high-cardinality aggregates: this caused the previous
+    # Java heap exhaustion.
+    #
+    # These thresholds are configurable starting values.
+    # They are not claimed to be statistically optimal.
+
+    sender_threshold = SENDER_ACTIVITY_THRESHOLD
+    receiver_threshold = RECEIVER_ACTIVITY_THRESHOLD
+    fanout_threshold = FANOUT_THRESHOLD
+    fanin_threshold = FANIN_THRESHOLD
+    burst_threshold = BURST_THRESHOLD
+
+    print("\nConfigured behavioural thresholds:")
+    print(f"Sender activity: {sender_threshold}")
+    print(f"Receiver activity: {receiver_threshold}")
+    print(f"Fan-out: {fanout_threshold} distinct receivers")
+    print(f"Fan-in: {fanin_threshold} distinct senders")
+    print(f"Daily burst: {burst_threshold} transactions")
+
+    # ========================================================
+    # 7. JOIN BEHAVIOURAL FEATURES
+    # ========================================================
+
+    print("\nJoining transaction and account features...")
+
+    enriched = (
+        df
+        .join(
+            sender_stats,
+            on="Sender_account",
+            how="left"
+        )
+        .join(
+            receiver_stats,
+            on="Receiver_account",
+            how="left"
+        )
+        .join(
+            daily_activity,
+            on=["Sender_account", "Date"],
+            how="left"
+        )
+    )
+
+    # Standardise categorical fields for consistent comparisons.
+    sender_location = F.upper(
+        F.trim(
+            F.coalesce(
+                F.col("Sender_bank_location").cast("string"),
+                F.lit("")
+            )
+        )
+    )
+
+    receiver_location = F.upper(
+        F.trim(
+            F.coalesce(
+                F.col("Receiver_bank_location").cast("string"),
+                F.lit("")
+            )
+        )
+    )
+
+    payment_type = F.upper(
+        F.coalesce(
+            F.col("Payment_type").cast("string"),
+            F.lit("")
+        )
+    )
+
+    payment_currency = F.upper(
+        F.coalesce(
+            F.col("Payment_currency").cast("string"),
+            F.lit("")
+        )
+    )
+
+    received_currency = F.upper(
+        F.coalesce(
+            F.col("Received_currency").cast("string"),
+            F.lit("")
+        )
+    )
+
+    # ========================================================
+    # 8. EXPLAINABLE SUSPICIOUS TRANSACTION RULES
+    # ========================================================
+
+    print("Applying explainable risk rules...")
+
+    scored = (
+        enriched
+
+        # Rule 1: Transaction amount is unusually high.
+        .withColumn(
+            "rule_high_amount",
+            (
+                F.col("Amount") >= F.lit(amount_threshold)
+            ).cast("int")
+        )
+
+        # Rule 2: Sender and receiver are in different locations.
+        # This is a risk signal, not proof of money laundering.
+        .withColumn(
+            "rule_cross_border",
+            (
+                (sender_location != "")
+                & (receiver_location != "")
+                & (sender_location != receiver_location)
+            ).cast("int")
+        )
+
+        # Rule 3: Payment type indicates a cash-related transaction.
+        .withColumn(
+            "rule_cash_related",
+            F.when(
+                payment_type.contains("CASH"),
+                1
+            ).otherwise(0)
+        )
+
+        # Rule 4: Sender has unusually high overall activity.
+        .withColumn(
+            "rule_high_sender_activity",
+            (
+                F.col("sender_tx_count")
+                >= F.lit(sender_threshold)
+            ).cast("int")
+        )
+
+        # Rule 5: Receiver has unusually high overall activity.
+        .withColumn(
+            "rule_high_receiver_activity",
+            (
+                F.col("receiver_tx_count")
+                >= F.lit(receiver_threshold)
+            ).cast("int")
+        )
+
+        # Rule 6: One sender distributes funds across many receivers.
+        .withColumn(
+            "rule_fan_out",
+            (
+                F.col("sender_unique_receivers")
+                >= F.lit(fanout_threshold)
+            ).cast("int")
+        )
+
+        # Rule 7: One receiver receives funds from many senders.
+        .withColumn(
+            "rule_fan_in",
+            (
+                F.col("receiver_unique_senders")
+                >= F.lit(fanin_threshold)
+            ).cast("int")
+        )
+
+        # Rule 8: Many transactions originate from one account
+        # on the same date.
+        .withColumn(
+            "rule_transaction_burst",
+            (
+                F.col("sender_day_count")
+                >= F.lit(burst_threshold)
+            ).cast("int")
+        )
+
+        # Rule 9: Payment and received currencies differ.
+        # Conversion can be legitimate, so this is only a signal.
+        .withColumn(
+            "rule_currency_difference",
+            (
+                (payment_currency != "")
+                & (received_currency != "")
+                & (payment_currency != received_currency)
+            ).cast("int")
+        )
+
+        # Rule 10: Amount is unusually high relative to this
+        # sender's own historical average and standard deviation.
+        .withColumn(
+            "rule_unusual_sender_amount",
+            (
+                (F.col("sender_tx_count") >= 3)
+                & (
+                    F.col("Amount")
+                    >
+                    (
+                        F.col("sender_avg_amount")
+                        + F.lit(3.0)
+                        * F.coalesce(
+                            F.col("sender_std_amount"),
+                            F.lit(0.0)
+                        )
+                    )
+                )
+            ).cast("int")
+        )
+    )
+
+    # ========================================================
+    # 9. WEIGHTED RISK SCORE AND ALERT EXPLANATIONS
+    # ========================================================
+
+    # Stronger weights are assigned to large amounts and
+    # network/burst patterns. Weights are initial heuristics
+    # and should be evaluated, not treated as proven probabilities.
+
+    scored = (
+        scored
+
+        .withColumn(
+            "risk_score",
+            (
+                2 * F.col("rule_high_amount")
+                + F.col("rule_cross_border")
+                + F.col("rule_cash_related")
+                + F.col("rule_high_sender_activity")
+                + F.col("rule_high_receiver_activity")
+                + 2 * F.col("rule_fan_out")
+                + 2 * F.col("rule_fan_in")
+                + 2 * F.col("rule_transaction_burst")
+                + F.col("rule_currency_difference")
+                + F.col("rule_unusual_sender_amount")
+            )
+        )
+
+        .withColumn(
+            "predicted_suspicious",
+            (
+                F.col("risk_score")
+                >= F.lit(RISK_ALERT_THRESHOLD)
+            ).cast("int")
+        )
+
+        .withColumn(
+            "risk_level",
+            F.when(
+                F.col("risk_score") >= 7,
+                F.lit("HIGH")
+            )
+            .when(
+                F.col("risk_score") >= RISK_ALERT_THRESHOLD,
+                F.lit("MEDIUM")
+            )
+            .otherwise(
+                F.lit("LOW")
+            )
+        )
+
+        # Human-readable reasons for the dashboard and report.
+        .withColumn(
+            "alert_reasons",
+            F.concat_ws(
+                ", ",
+                F.when(
+                    F.col("rule_high_amount") == 1,
+                    F.lit("High transaction amount")
+                ),
+                F.when(
+                    F.col("rule_cross_border") == 1,
+                    F.lit("Different sender/receiver locations")
+                ),
+                F.when(
+                    F.col("rule_cash_related") == 1,
+                    F.lit("Cash-related payment")
+                ),
+                F.when(
+                    F.col("rule_high_sender_activity") == 1,
+                    F.lit("High sender activity")
+                ),
+                F.when(
+                    F.col("rule_high_receiver_activity") == 1,
+                    F.lit("High receiver activity")
+                ),
+                F.when(
+                    F.col("rule_fan_out") == 1,
+                    F.lit("Fan-out transaction pattern")
+                ),
+                F.when(
+                    F.col("rule_fan_in") == 1,
+                    F.lit("Fan-in transaction pattern")
+                ),
+                F.when(
+                    F.col("rule_transaction_burst") == 1,
+                    F.lit("Daily transaction burst")
+                ),
+                F.when(
+                    F.col("rule_currency_difference") == 1,
+                    F.lit("Payment/received currency difference")
+                ),
+                F.when(
+                    F.col("rule_unusual_sender_amount") == 1,
+                    F.lit("Unusual amount for sender")
+                )
+            )
+        )
+    )
+
+    # ========================================================
+    # 10. SAVE SCORED TRANSACTIONS TO HDFS
+    # ========================================================
+
+    # Write once, then evaluate the persisted result. This avoids
+    # repeatedly executing the entire joined feature pipeline
+    # for separate evaluation and write actions.
+    print("\nWriting scored transactions to HDFS...")
+    print(f"Destination: {OUTPUT_PATH}")
+
+    (
+        scored
+        .write
+        .mode("overwrite")
+        .parquet(OUTPUT_PATH)
+    )
+
+    print("Scored transactions successfully written.")
+
+    # ========================================================
+    # 11. EVALUATION AGAINST GROUND-TRUTH LABELS
+    # ========================================================
+
+    # Ground-truth labels are used for evaluation only.
+    # They are not included in the risk-score calculation.
+    print("\nEvaluating saved predictions...")
+
+    saved_scored = spark.read.parquet(OUTPUT_PATH)
+
+    evaluation_row = saved_scored.agg(
+        F.count("*").alias("total_transactions"),
+
+        F.sum(
+            F.when(
+                (F.col("predicted_suspicious") == 1)
+                & (F.col("Is_laundering") == 1),
+                1
+            ).otherwise(0)
+        ).alias("true_positives"),
+
+        F.sum(
+            F.when(
+                (F.col("predicted_suspicious") == 1)
+                & (F.col("Is_laundering") == 0),
+                1
+            ).otherwise(0)
+        ).alias("false_positives"),
+
+        F.sum(
+            F.when(
+                (F.col("predicted_suspicious") == 0)
+                & (F.col("Is_laundering") == 1),
+                1
+            ).otherwise(0)
+        ).alias("false_negatives"),
+
+        F.sum(
+            F.when(
+                (F.col("predicted_suspicious") == 0)
+                & (F.col("Is_laundering") == 0),
+                1
+            ).otherwise(0)
+        ).alias("true_negatives"),
+
+        F.sum(
+            "predicted_suspicious"
+        ).alias("predicted_alerts"),
+
+        F.sum(
+            "risk_score"
+        ).alias("total_risk_score")
+    ).first().asDict()
+
+    tp = int(evaluation_row["true_positives"] or 0)
+    fp = int(evaluation_row["false_positives"] or 0)
+    fn = int(evaluation_row["false_negatives"] or 0)
+    tn = int(evaluation_row["true_negatives"] or 0)
+
+    total_transactions = int(
+        evaluation_row["total_transactions"] or 0
+    )
+
+    predicted_alerts = int(
+        evaluation_row["predicted_alerts"] or 0
+    )
+
+    precision = (
+        tp / (tp + fp)
+        if (tp + fp) > 0 else 0.0
+    )
+
+    recall = (
+        tp / (tp + fn)
+        if (tp + fn) > 0 else 0.0
+    )
+
+    f1_score = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0 else 0.0
+    )
+
+    accuracy = (
+        (tp + tn) / (tp + fp + fn + tn)
+        if (tp + fp + fn + tn) > 0 else 0.0
+    )
+
+    alert_rate = (
+        predicted_alerts / total_transactions
+        if total_transactions > 0 else 0.0
+    )
+
+    # ========================================================
+    # 12. SAVE EVALUATION REPORT
+    # ========================================================
+
+    metrics = {
+        "total_transactions": total_transactions,
+        "true_positives": tp,
+        "false_positives": fp,
+        "false_negatives": fn,
+        "true_negatives": tn,
+        "predicted_alerts": predicted_alerts,
+        "precision": precision,
+        "recall": recall,
+        "f1_score": f1_score,
+        "accuracy": accuracy,
+        "alert_rate": alert_rate,
+        "amount_threshold": float(amount_threshold),
+        "sender_activity_threshold": float(sender_threshold),
+        "receiver_activity_threshold": float(receiver_threshold),
+        "fanout_threshold": float(fanout_threshold),
+        "fanin_threshold": float(fanin_threshold),
+        "burst_threshold": float(burst_threshold),
+        "risk_alert_threshold": RISK_ALERT_THRESHOLD,
+        "prediction_rule": f"risk_score >= {RISK_ALERT_THRESHOLD}",
+        "method": (
+            "Explainable rule-based detection with behavioural "
+            "and transaction-network features; no machine learning"
+        ),
+        "evaluation_note": (
+            "Metrics are computed on the processed dataset. "
+            "This is not an independent holdout evaluation."
+        )
+    }
+
+    output_dir = Path("outputs")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics_path = output_dir / "evaluation_metrics.json"
+
+    with open(metrics_path, "w", encoding="utf-8") as file:
+        json.dump(metrics, file, indent=2)
+
+    # ========================================================
+    # 13. FINAL SUMMARY
+    # ========================================================
+
+    print("\n" + "=" * 65)
+    print("AML SENTINEL - DETECTION RESULTS")
+    print("=" * 65)
+
+    for key, value in metrics.items():
+        print(f"{key}: {value}")
+
+    print(f"\nMetrics saved to: {metrics_path}")
+    print(f"Scored data saved to: {OUTPUT_PATH}")
+    print("=" * 65)
+
+finally:
+    spark.stop()
+    print("Spark session stopped.")
