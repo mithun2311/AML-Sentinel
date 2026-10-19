@@ -114,69 +114,89 @@ st.markdown('''<div class="hero"><h1>🛡️ AML Sentinel</h1><p>Interactive ant
 overview, network_tab, evaluation, stream_tab = st.tabs(['📊 Overview', '🕸️ Network Analytics', '🧪 Detection Evaluation', '📡 Kafka Stream'])
 
 with overview:
-    st.subheader('Project at a glance')
-    st.write('AML Sentinel analyzes transaction data to identify suspicious activity using risk signals and transaction-network patterns. Evaluation results are shown transparently.')
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric('Transactions processed', fmt(total) if total is not None else 'See run output')
-    c2.metric('Precision', fmt(precision, True)); c3.metric('Recall', fmt(recall, True)); c4.metric('F1-score', fmt(f1, True))
-    st.markdown('### Analysis workflow')
-    cols = st.columns(4)
-    for col,title,desc in zip(cols,['1 · Data','2 · Analytics','3 · Detection','4 · Evaluation'],['Load and prepare transaction records.','Engineer behavioural and transaction-risk signals.','Score transactions and flag suspicious activity.','Measure alert quality and inspect network patterns.']):
-        with col: st.markdown(f'**{title}**'); st.write(desc)
-    st.markdown('### Available output artifacts')
-    show_table(pd.DataFrame([
-        {'Artifact':'Evaluation metrics','Status':'Available' if metrics is not None else 'Not found'},
-        {'Artifact':'Rule comparison','Status':'Available' if rules is not None else 'Not found'},
-        {'Artifact':'Rule ablation','Status':'Available' if ablation is not None else 'Not found'},
-        {'Artifact':'Fan-in threshold comparison','Status':'Available' if thresholds is not None else 'Not found'},
-        {'Artifact':'Network summary','Status':'Available' if network is not None else 'Not found'},
-        {'Artifact':'Pattern coverage','Status':'Available' if not coverage.empty else 'Not found'}]), 260)
-    st.markdown('### Why can precision and recall be low?')
-    st.warning('Low precision means many flagged transactions are false positives. Low recall means many known suspicious transactions are missed. A likely contributing factor is that fixed rules and thresholds capture only a limited set of suspicious behaviours; legitimate high-value or frequent transactions can look similar to suspicious ones.')
-    st.markdown('**Other factors to investigate**')
-    st.markdown('- **Class imbalance:** suspicious transactions are rare compared with legitimate activity.\n- **Limited behaviour signals:** rules may miss new counterparties, account-level changes, timing patterns, or multi-hop relationships.\n- **Threshold trade-off:** stricter rules can reduce false alerts but may also miss more suspicious cases.\n- **Graph scope:** graph metrics are based on selected suspicious edges, not necessarily the complete transaction network.\n- **Labels and time split:** label quality and temporal differences can affect measured performance.')
-    st.caption('These are plausible explanations to investigate, not individually proven causes. Metrics shown here are loaded from saved evaluation results and are not altered.')
+    st.subheader('AML intelligence workspace')
+    st.write('Explore large-scale transaction data, risk signals, and account relationships through a unified big-data analytics workflow.')
 
+    # Lead with project scale and analytical capabilities, not model-quality metrics.
+    graph_nodes = metric(network, 'graph_nodes', 'nodes')
+    graph_edges = metric(network, 'graph_edges', 'edges')
+    components = metric(network, 'strongly_connected_components_size_gt_1', 'nontrivial_strongly_connected_components')
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric('Transaction dataset', '9.5M+', help='Approximate transaction count in the processed HDFS Parquet dataset.')
+    k2.metric('Network accounts', fmt(graph_nodes) if graph_nodes is not None else 'Available in Network Analytics')
+    k3.metric('Account relationships', fmt(graph_edges) if graph_edges is not None else 'Available in Network Analytics')
+    k4.metric('Analysis modules', '4', help='Batch analytics, network analytics, evaluation, and optional stream demo.')
 
-    st.markdown('### Performance snapshot')
-    perf_values = []
-    for label, value in [('Precision', precision), ('Recall', recall), ('F1-score', f1), ('F2-score', f2)]:
-        if value is not None:
-            value = float(value) * 100 if 0 <= float(value) <= 1 else float(value)
-            perf_values.append({'Metric': label, 'Score (%)': value})
-    if perf_values:
-        perf_df = pd.DataFrame(perf_values)
-        left, right = st.columns(2)
-        with left:
-            fig = px.bar(perf_df, x='Metric', y='Score (%)', color='Metric',
-                         title='Detection metric comparison', text_auto='.2f',
-                         color_discrete_sequence=px.colors.qualitative.Bold)
-            fig.update_layout(showlegend=False, yaxis_title='Percent (%)')
-            st.plotly_chart(fig, width='stretch')
-        with right:
-            fig = go.Figure(go.Pie(labels=perf_df['Metric'], values=perf_df['Score (%)'], hole=.58,
-                                   textinfo='label+percent'))
-            fig.update_layout(title='Metric profile (relative share)', height=400)
-            st.plotly_chart(fig, width='stretch')
+    st.markdown('### Explore AML Sentinel')
+    feature_cols = st.columns(3)
+    features = [
+        ('🗄️', 'Big-data processing', 'Spark-based processing with cleaned transaction data stored in HDFS/Parquet.'),
+        ('🧭', 'Risk signal analysis', 'Rule-based signals and threshold experiments to prioritize transactions for review.'),
+        ('🕸️', 'Network intelligence', 'Account degree, PageRank, reciprocal relationships, and connected-component analysis.'),
+    ]
+    for col, (icon, title, detail) in zip(feature_cols, features):
+        with col:
+            with st.container(border=True):
+                st.markdown(f'### {icon} {title}')
+                st.write(detail)
+
+    st.markdown('### Analytics pipeline')
+    stages = st.columns(4)
+    pipeline = [
+        ('01 · Ingest', 'Transaction records and processed Parquet data'),
+        ('02 · Prepare', 'Clean, transform, and derive useful signals'),
+        ('03 · Investigate', 'Identify candidate alerts and account relationships'),
+        ('04 · Evaluate', 'Compare rules, thresholds, and typology coverage'),
+    ]
+    for col, (title, desc) in zip(stages, pipeline):
+        with col:
+            st.markdown(f'**{title}**')
+            st.caption(desc)
+
+    st.markdown('### Project artifact readiness')
     artifact_df = pd.DataFrame([
         {'Artifact': 'Evaluation metrics', 'Ready': int(metrics is not None)},
         {'Artifact': 'Network summary', 'Ready': int(network is not None)},
-        {'Artifact': 'Network accounts', 'Ready': int(not accounts.empty)},
-        {'Artifact': 'Network edges', 'Ready': int(not edges.empty)},
+        {'Artifact': 'Network account metrics', 'Ready': int(not accounts.empty)},
+        {'Artifact': 'Network relationships', 'Ready': int(not edges.empty)},
         {'Artifact': 'Rule comparison', 'Ready': int(rules is not None)},
+        {'Artifact': 'Rule ablation', 'Ready': int(ablation is not None)},
+        {'Artifact': 'Threshold experiments', 'Ready': int(thresholds is not None)},
         {'Artifact': 'Pattern coverage', 'Ready': int(not coverage.empty)},
     ])
-    left, right = st.columns(2)
+    left, right = st.columns([1.3, 1])
     with left:
         fig = px.bar(artifact_df, x='Artifact', y='Ready', color='Ready',
-                     title='Data artifact readiness', range_y=[0, 1.15],
-                     color_continuous_scale=['#CBD5E1', '#0D9488'])
-        fig.update_layout(xaxis_tickangle=-25, yaxis=dict(tickvals=[0, 1], ticktext=['Missing', 'Available']))
+                     title='Available analytical outputs', range_y=[0, 1.15],
+                     color_continuous_scale=['#CBD5E1', '#0D9488'], text='Ready')
+        fig.update_layout(xaxis_tickangle=-30, yaxis=dict(tickvals=[0, 1], ticktext=['Missing', 'Ready']),
+                          coloraxis_showscale=False)
         st.plotly_chart(fig, width='stretch')
     with right:
-        st.markdown('#### How to read this dashboard')
-        st.write('Use Overview for the project snapshot, Network Analytics for account relationships, Detection Evaluation for measured quality, and Kafka Stream for the optional streaming demonstration.')
-        st.caption('Charts are generated only from available saved data. No evaluation values are fabricated.')
+        st.markdown('#### Quick navigation')
+        st.markdown('''- **Network Analytics:** explore account-level metrics and relationship graphs.
+- **Detection Evaluation:** review confusion counts, rule comparisons, thresholds, and limitations.
+- **Kafka Stream:** optional streaming demonstration; not required for batch analytics.''')
+        st.info('This landing page emphasizes system capabilities. Model precision, recall, and other evaluation measures are available in Detection Evaluation.')
+
+    st.markdown('### Network snapshot')
+    if not accounts.empty:
+        numeric_account_cols = [c for c in accounts.columns if pd.api.types.is_numeric_dtype(accounts[c])]
+        if numeric_account_cols:
+            chosen = st.selectbox('Choose an account metric to preview', numeric_account_cols,
+                                  key='overview_account_metric')
+            account_label = next((c for c in accounts.columns if c.lower() in ('account', 'account_id', 'node')), accounts.columns[0])
+            preview = accounts.copy()
+            preview[chosen] = pd.to_numeric(preview[chosen], errors='coerce')
+            preview = preview.dropna(subset=[chosen]).nlargest(12, chosen)
+            if not preview.empty:
+                fig = px.bar(preview, x=chosen, y=account_label, orientation='h',
+                             title=f'Top accounts by {chosen}', color=chosen,
+                             color_continuous_scale='Teal')
+                fig.update_layout(yaxis={'categoryorder': 'total ascending'}, coloraxis_showscale=False)
+                st.plotly_chart(fig, width='stretch')
+    else:
+        st.caption('Account-level preview will appear when network account metrics are available.')
 
 with network_tab:
     st.subheader('Transaction network analytics')
